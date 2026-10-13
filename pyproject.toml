@@ -11,6 +11,7 @@ requires-python = ">=3.12,<3.15"
 dependencies = [
     "Django>=5.2,<5.3",
     "djangorestframework>=3.16,<3.17",
+    "djangorestframework-simplejwt>=5.5,<5.6",
     "drf-spectacular>=0.28,<0.29",
     "gunicorn>=23,<24",
     "psycopg[binary]>=3.2,<3.4",
@@ -29,7 +30,7 @@ include = ["apps*", "config*"]
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings.test"
 python_files = ["test_*.py", "*_test.py"]
-testpaths = ["tests"]
+testpaths = ["tests", "apps"]
 addopts = "--strict-markers --reuse-db"
 
 [tool.ruff]
