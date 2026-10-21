@@ -120,7 +120,7 @@ SPECTACULAR_SETTINGS = {
         "Parking Lot Management modular-monolith API. Authenticate with a JWT Bearer access token "
         "for protected operations."
     ),
-    "VERSION": "2.0.0",
+    "VERSION": "3.0.0",
     "SERVE_PERMISSIONS": ["rest_framework.permissions.AllowAny"],
     "ENUM_NAME_OVERRIDES": {
         "UserRole": "apps.accounts.models.User.Role",
