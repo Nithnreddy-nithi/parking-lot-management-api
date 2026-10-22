@@ -296,7 +296,8 @@ class ParkingSpotDetailView(APIView):
         request=ParkingSpotUpdateSerializer,
         responses={200: ParkingSpotOutputSerializer, 409: CONFLICT_RESPONSE},
         description=(
-            "ADMIN only. floor is immutable. Restrictions for occupied spots belong to Phase 4."
+            "ADMIN only. floor is immutable. Number and type cannot change while occupied; "
+            "operational status may still block future allocation."
         ),
         tags=["Parking configuration"],
     )
@@ -369,7 +370,10 @@ class VehicleDetailView(APIView):
     @extend_schema(
         request=VehicleUpdateSerializer,
         responses={200: VehicleOutputSerializer, 409: CONFLICT_RESPONSE},
-        description="Update an owned vehicle. owner cannot be supplied or changed.",
+        description=(
+            "Update an owned vehicle. owner cannot be supplied or changed. Registration, type, "
+            "and deactivation are blocked while the vehicle has an open session."
+        ),
         tags=["Vehicles"],
     )
     def patch(self, request: Request, pk: int) -> Response:

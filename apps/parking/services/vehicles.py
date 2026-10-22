@@ -23,10 +23,32 @@ def create_vehicle(*, owner: User, data: Mapping) -> Vehicle:
     return _save(Vehicle(owner=owner, **dict(data)))
 
 
+@transaction.atomic
 def update_vehicle(*, vehicle: Vehicle, data: Mapping) -> Vehicle:
+    from apps.sessions.enums import OPEN_SESSION_STATUSES
+    from apps.sessions.exceptions import EntryConflict
+    from apps.sessions.models import ParkingSession
+
+    locked_vehicle = Vehicle.objects.select_for_update().get(pk=vehicle.pk)
+    changes_protected_state = any(
+        field in data and data[field] != getattr(locked_vehicle, field)
+        for field in ("registration_number", "vehicle_type")
+    ) or (data.get("is_active") is False and locked_vehicle.is_active)
+    if (
+        changes_protected_state
+        and ParkingSession.objects.filter(
+            vehicle_id=locked_vehicle.pk,
+            status__in=OPEN_SESSION_STATUSES,
+        ).exists()
+    ):
+        raise EntryConflict(
+            code="VEHICLE_HAS_OPEN_SESSION",
+            detail="An active parking session prevents this vehicle change.",
+        )
+
     fields = []
     for field in ("registration_number", "vehicle_type", "is_active"):
         if field in data:
-            setattr(vehicle, field, data[field])
+            setattr(locked_vehicle, field, data[field])
             fields.append(field)
-    return _save(vehicle, update_fields=fields) if fields else vehicle
+    return _save(locked_vehicle, update_fields=fields) if fields else locked_vehicle
