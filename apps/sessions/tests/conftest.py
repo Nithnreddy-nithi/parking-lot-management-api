@@ -4,6 +4,8 @@ from rest_framework.test import APIClient
 from apps.accounts.models import User
 from apps.parking.enums import GateType, SpotOperationalStatus, SpotType, VehicleType
 from apps.parking.models import Floor, Gate, ParkingLot, ParkingSpot, Vehicle
+from apps.pricing.enums import Currency
+from apps.pricing.models import PricingPolicy
 
 
 @pytest.fixture
@@ -50,7 +52,33 @@ def floor(parking_lot):
 
 
 @pytest.fixture
-def entry_gate(parking_lot):
+def pricing_policies(parking_lot, app_admin):
+    return {
+        vehicle_type: PricingPolicy.objects.create(
+            parking_lot=parking_lot,
+            vehicle_type=vehicle_type,
+            version=1,
+            currency=Currency.INR,
+            hourly_rate=rate,
+            grace_minutes=15,
+            daily_cap=cap,
+            created_by=app_admin,
+        )
+        for vehicle_type, rate, cap in (
+            (VehicleType.MOTORCYCLE, "20.00", "200.00"),
+            (VehicleType.CAR, "30.00", "300.00"),
+            (VehicleType.TRUCK, "50.00", "500.00"),
+        )
+    }
+
+
+@pytest.fixture
+def pricing_policy(pricing_policies):
+    return pricing_policies[VehicleType.CAR]
+
+
+@pytest.fixture
+def entry_gate(parking_lot, pricing_policies):
     return Gate.objects.create(
         parking_lot=parking_lot,
         code="IN",

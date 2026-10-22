@@ -1,9 +1,9 @@
 # Parking Lot Management API
 
 A Django 5.2 LTS and Django REST Framework modular monolith running on Python 3.12 and PostgreSQL.
-Phase 4 adds transactional vehicle entry, compatible spot allocation, parking tickets, scoped
-session reads, and informational availability to the existing JWT, user, parking-configuration, and
-vehicle foundation. Checkout, exit, pricing, payments, Redis, and Celery remain outside this phase.
+Phase 5 adds immutable pricing versions, entry-time pricing snapshots, deterministic hourly billing,
+and frozen checkout quotes to the existing transactional entry system. Payments, vehicle exit,
+refunds, Redis, and Celery remain outside this phase.
 
 Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is available at
 `/api/v1/schema/`.
@@ -19,9 +19,12 @@ Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is
 - `apps/parking/`: constrained parking models, configuration/vehicle APIs, selectors, services, and
   the idempotent demo-data command.
 - `apps/sessions/`: session lifecycle data, allocation policy, locking repository, entry service,
-  scoped read selectors, availability aggregation, APIs, and concurrency tests.
+  checkout coordination, scoped read selectors, availability aggregation, APIs, and concurrency
+  tests.
+- `apps/pricing/`: versioned policies, immutable snapshots and quotes, pure fee calculators,
+  pricing-management APIs, selectors, and legacy backfill tooling.
 - `apps/<module>/`: accounts, parking, sessions, pricing, payments, reporting, and audit boundaries.
-  Pricing, payments, reporting, and audit remain intentional skeletons for later phases.
+  Payments, reporting, and audit remain intentional skeletons for later phases.
 - `tests/` and application `tests/` packages: PostgreSQL model, API, authentication, authorization,
   ownership, constraint, and query-count tests.
 - `docs/decisions/`: architecture and collaboration decisions.
@@ -41,7 +44,7 @@ application roles and timestamps.
 | --- | --- | --- | --- | --- |
 | CUSTOMER | Yes | No | No | Only if separately granted `is_staff` |
 | OPERATOR | Yes | Yes | No | Only if separately granted `is_staff` |
-| ADMIN | Yes | Yes when implemented | Yes | Only if separately granted `is_staff` |
+| ADMIN | Yes | Yes | Yes | Only if separately granted `is_staff` |
 | Django superuser | Yes | Privileged override | Yes, but its record is API-edit protected | Yes |
 
 `role` expresses business authority. `is_staff` controls access to Django's admin UI, while
@@ -58,6 +61,9 @@ Django flag. A PostgreSQL check constraint accepts only `ADMIN`, `OPERATOR`, or 
 | Admit a registered vehicle | Yes | Yes | No |
 | Session reads | All | All | Own vehicles only |
 | Availability summary | Yes | Yes | Yes |
+| Pricing policy management | Read/write | No | No |
+| Checkout | Yes | Yes | No |
+| Quote reads | All | All | Own vehicles only |
 
 Django superusers retain the documented configuration override. Vehicle access remains owner-scoped
 even for ADMIN and OPERATOR accounts. A cross-owner vehicle ID returns 404 rather than revealing that
@@ -111,15 +117,16 @@ There is deliberately no public endpoint for creating an ADMIN.
 
 ## Seed demo parking configuration
 
-After migrations, create one demo lot with basement/ground floors, entry/exit gates, and a mixture
-of motorcycle, compact, large, maintenance, and disabled spots:
+After migrations and ADMIN creation, create demo configuration and one initial INR policy for every
+vehicle type. The required username is recorded as the pricing creator; the command never creates a
+user or password:
 
 ```powershell
-docker compose exec web python manage.py seed_parking
+docker compose exec web python manage.py seed_parking --created-by app-admin
 ```
 
 The command is idempotent. Repeated runs add missing demo records but do not overwrite matching
-records that have been customized. It never creates users or passwords.
+configuration or any existing pricing history.
 
 ## Authentication examples
 
@@ -311,9 +318,9 @@ POST /api/v1/parking-sessions/entry/
 → JWT authentication and ADMIN/OPERATOR permission
 → strict serializer accepts only vehicle_id and entry_gate_id
 → entry service opens one PostgreSQL transaction
-→ repository locks lot → gate → vehicle → selected spot
+→ repository locks lot → gate → vehicle → active pricing policy → selected spot
 → allocation policy applies compatibility and deterministic preference
-→ service rechecks eligibility and creates ACTIVE session snapshots
+→ service rechecks eligibility and creates the ACTIVE session and immutable pricing snapshot
 → PostgreSQL partial unique constraints guard vehicle and spot
 → safe ticket serializer returns HTTP 201
 ```
@@ -322,6 +329,59 @@ Lot-row serialization is deliberately correctness-first and limits parallel entr
 one lot. It can be replaced with finer-grained locking after measurement. The lock protocol,
 partial constraints, updated ER diagram, and sequence diagram are in
 [ADR 0004](docs/decisions/0004-transactional-entry-and-availability.md).
+
+## Pricing and checkout
+
+ADMIN publishes a new server-versioned policy. Publication retires the previous active version for
+the same lot and vehicle type in one transaction:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/pricing-policies/ \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"parking_lot":1,"vehicle_type":"CAR","currency":"INR","hourly_rate":"30.00","grace_minutes":15,"daily_cap":"300.00"}'
+```
+
+Published financial fields are immutable. Rate changes create version 2, version 3, and so on.
+Entry selects pricing by vehicle type—not allocated spot type—and copies the policy into a snapshot
+in the same transaction as the session. If pricing is missing, entry returns
+`PRICING_NOT_CONFIGURED` without creating a partial session.
+
+ADMIN or OPERATOR freezes the amount due with:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/checkout/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Checkout uses elapsed UTC duration, checks grace once, rounds every started hour upward, and applies
+the daily cap to consecutive 24-hour blocks from entry. It creates one immutable quote and changes
+`ACTIVE` to `PAYMENT_PENDING`. Repeated calls return that original quote and timestamp. The amount
+does not continue accruing after checkout in this product version.
+
+Checkout does not close the session, set `closed_at`, mark it paid, or release its spot. A
+zero-charge quote also remains `PAYMENT_PENDING` until Phase 6 defines settlement.
+
+Customers can read a quote only for their own session:
+
+```bash
+curl http://localhost:8000/api/v1/parking-sessions/1/quote/ \
+  -H "Authorization: Bearer <access-token>"
+```
+
+Sessions created before Phase 5 deliberately have no invented price. Select the historically
+correct policy explicitly and optionally restrict the affected session IDs:
+
+```powershell
+docker compose exec web python manage.py backfill_pricing_snapshots `
+  --policy-id 7 --session-id 101 --session-id 102
+```
+
+The command is idempotent and never overwrites a snapshot. Until backfilled, checkout returns
+`SESSION_PRICING_NOT_CONFIGURED`. Pricing decisions, the updated ER diagram, and checkout sequence
+are in [ADR 0005](docs/decisions/0005-versioned-pricing-and-checkout.md).
 
 ## Errors
 

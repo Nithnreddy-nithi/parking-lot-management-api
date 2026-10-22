@@ -12,6 +12,9 @@ from rest_framework.views import APIView
 from apps.accounts.models import User
 from apps.accounts.permissions import IsAdminOrOperatorRole
 from apps.parking.models import ParkingLot
+from apps.pricing.api.serializers import CheckoutQuoteOutputSerializer, EmptyCheckoutSerializer
+from apps.pricing.exceptions import QuoteNotFound
+from apps.pricing.selectors import quote_for_session
 from apps.sessions.api.serializers import (
     AvailabilitySerializer,
     EntryRequestSerializer,
@@ -19,7 +22,7 @@ from apps.sessions.api.serializers import (
     SessionFilterSerializer,
 )
 from apps.sessions.selectors import availability_by_spot_type, session_list
-from apps.sessions.services import build_entry_service
+from apps.sessions.services import build_checkout_service, build_entry_service
 
 
 class SessionPagination(PageNumberPagination):
@@ -118,6 +121,48 @@ class ParkingSessionDetailView(APIView):
         owner_id = None if _is_staff_reader(request.user) else request.user.pk
         parking_session = get_object_or_404(session_list(owner_id=owner_id), pk=pk)
         return Response(ParkingSessionOutputSerializer(parking_session).data)
+
+
+class ParkingSessionCheckoutView(APIView):
+    permission_classes = [IsAdminOrOperatorRole]
+
+    @extend_schema(
+        request=EmptyCheckoutSerializer,
+        responses={
+            200: CheckoutQuoteOutputSerializer,
+            409: OpenApiResponse(description="Pricing or session-state business conflict."),
+        },
+        description=(
+            "ADMIN or OPERATOR only. Atomically freezes the fee quote and transitions ACTIVE to "
+            "PAYMENT_PENDING. Repeated checkout returns the original quote."
+        ),
+        tags=["Parking sessions"],
+    )
+    def post(self, request: Request, pk: int) -> Response:
+        serializer = EmptyCheckoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        quote = build_checkout_service().checkout(session_id=pk, actor=request.user)
+        return Response(CheckoutQuoteOutputSerializer(quote).data)
+
+
+class ParkingSessionQuoteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: CheckoutQuoteOutputSerializer},
+        description=(
+            "ADMIN and OPERATOR may read all quotes. Customers may read only quotes for sessions "
+            "associated with their vehicles."
+        ),
+        tags=["Parking sessions"],
+    )
+    def get(self, request: Request, pk: int) -> Response:
+        owner_id = None if _is_staff_reader(request.user) else request.user.pk
+        parking_session = get_object_or_404(session_list(owner_id=owner_id), pk=pk)
+        quote = quote_for_session(session_id=parking_session.pk)
+        if quote is None:
+            raise QuoteNotFound()
+        return Response(CheckoutQuoteOutputSerializer(quote).data)
 
 
 class ParkingAvailabilityView(APIView):

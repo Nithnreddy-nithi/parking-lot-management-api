@@ -3,8 +3,10 @@ from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 
+from apps.accounts.models import User
 from apps.parking.enums import SpotOperationalStatus, SpotType
 from apps.parking.models import Floor, Gate, ParkingLot, ParkingSpot, Vehicle
+from apps.pricing.models import PricingPolicy
 
 
 @pytest.mark.django_db
@@ -51,27 +53,36 @@ def test_parent_relationships_are_protected(parking_lot, floor, parking_spot):
 
 @pytest.mark.django_db
 def test_seed_command_is_idempotent_and_preserves_customized_data():
-    call_command("seed_parking")
+    admin = User.objects.create_user(username="seed-admin", role=User.Role.ADMIN)
+    call_command("seed_parking", created_by=admin.username)
     counts = (
         ParkingLot.objects.count(),
         Floor.objects.count(),
         Gate.objects.count(),
         ParkingSpot.objects.count(),
+        PricingPolicy.objects.count(),
     )
     parking_lot = ParkingLot.objects.get(code="DEMO")
     parking_lot.name = "Customized Demo Name"
     parking_lot.save(update_fields=["name", "updated_at"])
 
-    call_command("seed_parking")
+    first_policy = PricingPolicy.objects.get(parking_lot=parking_lot, vehicle_type="CAR")
+    first_policy.is_active = False
+    first_policy.save(update_fields=["is_active"])
+
+    call_command("seed_parking", created_by=admin.username)
 
     assert (
         ParkingLot.objects.count(),
         Floor.objects.count(),
         Gate.objects.count(),
         ParkingSpot.objects.count(),
+        PricingPolicy.objects.count(),
     ) == counts
     parking_lot.refresh_from_db()
     assert parking_lot.name == "Customized Demo Name"
+    first_policy.refresh_from_db()
+    assert first_policy.is_active is False
     assert SpotOperationalStatus.MAINTENANCE in ParkingSpot.objects.values_list(
         "operational_status", flat=True
     )

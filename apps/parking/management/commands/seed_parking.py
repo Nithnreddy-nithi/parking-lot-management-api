@@ -1,15 +1,32 @@
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
+from apps.accounts.models import User
 from apps.parking.enums import GateType, SpotOperationalStatus, SpotType
 from apps.parking.models import Floor, Gate, ParkingLot, ParkingSpot
+from apps.pricing.enums import Currency
+from apps.pricing.models import PricingPolicy
 
 
 class Command(BaseCommand):
-    help = "Create idempotent demo parking configuration without changing existing records."
+    help = "Create idempotent demo parking configuration and pricing without overwrites."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--created-by",
+            required=True,
+            help="Existing ADMIN/superuser username recorded as creator of new demo pricing.",
+        )
 
     @transaction.atomic
     def handle(self, *args, **options):
+        try:
+            creator = User.objects.get(username=options["created_by"])
+        except User.DoesNotExist as exc:
+            raise CommandError("The --created-by user does not exist.") from exc
+        if not creator.is_superuser and creator.role != User.Role.ADMIN:
+            raise CommandError("The --created-by user must be an ADMIN or Django superuser.")
+
         parking_lot, lot_created = ParkingLot.objects.get_or_create(
             code="DEMO",
             defaults={
@@ -23,6 +40,7 @@ class Command(BaseCommand):
             raise CommandError(
                 "The DEMO parking lot is inactive; activate it before adding missing demo children."
             )
+        parking_lot = ParkingLot.objects.select_for_update().get(pk=parking_lot.pk)
 
         basement, basement_created = Floor.objects.get_or_create(
             parking_lot=parking_lot,
@@ -68,12 +86,37 @@ class Command(BaseCommand):
             )
             spots_created += int(created)
 
+        pricing_specs = (
+            ("MOTORCYCLE", "20.00", 15, "200.00"),
+            ("CAR", "30.00", 15, "300.00"),
+            ("TRUCK", "50.00", 15, "500.00"),
+        )
+        policies_created = 0
+        for vehicle_type, hourly_rate, grace_minutes, daily_cap in pricing_specs:
+            if not PricingPolicy.objects.filter(
+                parking_lot=parking_lot,
+                vehicle_type=vehicle_type,
+            ).exists():
+                PricingPolicy.objects.create(
+                    parking_lot=parking_lot,
+                    vehicle_type=vehicle_type,
+                    version=1,
+                    currency=Currency.INR,
+                    hourly_rate=hourly_rate,
+                    grace_minutes=grace_minutes,
+                    daily_cap=daily_cap,
+                    is_active=True,
+                    created_by=creator,
+                )
+                policies_created += 1
+
         floors_created = int(basement_created) + int(ground_created)
         self.stdout.write(
             self.style.SUCCESS(
                 "Demo parking configuration ready: "
                 f"lots created={int(lot_created)}, floors created={floors_created}, "
-                f"gates created={gates_created}, spots created={spots_created}. "
+                f"gates created={gates_created}, spots created={spots_created}, "
+                f"pricing policies created={policies_created}. "
                 "Existing matching records were preserved."
             )
         )
