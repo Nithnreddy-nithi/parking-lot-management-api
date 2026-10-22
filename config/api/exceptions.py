@@ -1,7 +1,13 @@
 from http import HTTPStatus
 
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.views import exception_handler
+
+
+class Conflict(APIException):
+    status_code = 409
+    default_detail = "The request conflicts with an existing resource."
+    default_code = "conflict"
 
 
 def api_exception_handler(exc, context):

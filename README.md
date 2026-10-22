@@ -1,9 +1,9 @@
 # Parking Lot Management API
 
 A Django 5.2 LTS and Django REST Framework modular monolith running on Python 3.12 and PostgreSQL.
-Phase 2 adds customer registration, JWT authentication, profile/password self-service, and guarded
-user administration. Parking lots, floors, spots, sessions, pricing, and payments remain outside
-this phase.
+Phase 4 adds transactional vehicle entry, compatible spot allocation, parking tickets, scoped
+session reads, and informational availability to the existing JWT, user, parking-configuration, and
+vehicle foundation. Checkout, exit, pricing, payments, Redis, and Celery remain outside this phase.
 
 Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is available at
 `/api/v1/schema/`.
@@ -16,9 +16,14 @@ Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is
 - `apps/accounts/services/`: registration, user update, password, and token-revocation use cases.
 - `apps/accounts/selectors.py`: user-list read queries and filters.
 - `apps/accounts/permissions.py`: reusable application-role authorization.
+- `apps/parking/`: constrained parking models, configuration/vehicle APIs, selectors, services, and
+  the idempotent demo-data command.
+- `apps/sessions/`: session lifecycle data, allocation policy, locking repository, entry service,
+  scoped read selectors, availability aggregation, APIs, and concurrency tests.
 - `apps/<module>/`: accounts, parking, sessions, pricing, payments, reporting, and audit boundaries.
-  Empty modules remain intentional Phase 1/2 skeletons.
-- `tests/` and `apps/accounts/tests/`: PostgreSQL model, API, authentication, and authorization tests.
+  Pricing, payments, reporting, and audit remain intentional skeletons for later phases.
+- `tests/` and application `tests/` packages: PostgreSQL model, API, authentication, authorization,
+  ownership, constraint, and query-count tests.
 - `docs/decisions/`: architecture and collaboration decisions.
 
 The write path is **request → view → serializer → service → Django ORM/PostgreSQL → safe response
@@ -32,16 +37,31 @@ application roles and timestamps.
 
 ## Roles and Django privilege flags
 
-| Account type | Self profile | Future parking operations | Manage non-admin users | Django admin site |
+| Account type | Self profile | Parking entry | Manage non-admin users | Django admin site |
 | --- | --- | --- | --- | --- |
 | CUSTOMER | Yes | No | No | Only if separately granted `is_staff` |
-| OPERATOR | Yes | Reserved for later phases | No | Only if separately granted `is_staff` |
+| OPERATOR | Yes | Yes | No | Only if separately granted `is_staff` |
 | ADMIN | Yes | Yes when implemented | Yes | Only if separately granted `is_staff` |
 | Django superuser | Yes | Privileged override | Yes, but its record is API-edit protected | Yes |
 
 `role` expresses business authority. `is_staff` controls access to Django's admin UI, while
 `is_superuser` is Django's privileged override. Creating an application ADMIN does not set either
 Django flag. A PostgreSQL check constraint accepts only `ADMIN`, `OPERATOR`, or `CUSTOMER`.
+
+## Parking permissions
+
+| API area | ADMIN | OPERATOR | CUSTOMER |
+| --- | --- | --- | --- |
+| Parking configuration lists/details | Read/write | Read-only | No access |
+| Own vehicles | Read/write | Own records only | Own records only |
+| Other users' vehicle CRUD | No access | No access | No access |
+| Admit a registered vehicle | Yes | Yes | No |
+| Session reads | All | All | Own vehicles only |
+| Availability summary | Yes | Yes | Yes |
+
+Django superusers retain the documented configuration override. Vehicle access remains owner-scoped
+even for ADMIN and OPERATOR accounts. A cross-owner vehicle ID returns 404 rather than revealing that
+the record exists.
 
 ## Local environment setup
 
@@ -88,6 +108,18 @@ docker compose exec web python manage.py createsuperuser
 ```
 
 There is deliberately no public endpoint for creating an ADMIN.
+
+## Seed demo parking configuration
+
+After migrations, create one demo lot with basement/ground floors, entry/exit gates, and a mixture
+of motorcycle, compact, large, maintenance, and disabled spots:
+
+```powershell
+docker compose exec web python manage.py seed_parking
+```
+
+The command is idempotent. Repeated runs add missing demo records but do not overwrite matching
+records that have been customized. It never creates users or passwords.
 
 ## Authentication examples
 
@@ -156,6 +188,141 @@ to existing access tokens on the next request.
 Registration and token acquisition use configurable DRF throttles. These are application-level
 controls and do not replace production rate limiting at a reverse proxy, API gateway, or firewall.
 
+## Parking configuration examples
+
+Create a parking lot as an ADMIN:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-lots/ \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"blr-central","name":"Bengaluru Central","address":"MG Road","timezone":"Asia/Kolkata"}'
+```
+
+Create a compact spot after creating its floor:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/spots/ \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"floor":1,"number":"b1-c-01","spot_type":"COMPACT","operational_status":"ENABLED"}'
+```
+
+List configuration as ADMIN or OPERATOR with validated filters:
+
+```bash
+curl "http://localhost:8000/api/v1/spots/?parking_lot=1&spot_type=COMPACT&operational_status=ENABLED" \
+  -H "Authorization: Bearer <access-token>"
+```
+
+`ENABLED` describes operational configuration; it does not mean unoccupied. Occupancy is derived
+from open parking sessions. Physical capacity is derived from spot rows rather than a manually
+editable counter. Deactivating a lot or floor preserves descendants but makes them effectively
+unavailable for new entry.
+
+An ADMIN spot-creation request follows this path:
+
+```text
+POST /api/v1/spots/
+→ JWT loads the current database user
+→ configuration permission requires ADMIN or superuser
+→ serializer validates floor ID, number, type, and operational status
+→ service locks and verifies the active floor and lot
+→ model normalizes the number
+→ PostgreSQL enforces enum, nonblank, and floor-scoped uniqueness constraints
+→ output serializer returns the safe spot representation with HTTP 201
+```
+
+A known uniqueness race is translated to a sanitized HTTP 409 response; raw PostgreSQL errors are
+never returned.
+
+## Vehicle examples
+
+Associate a vehicle with the authenticated account:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/vehicles/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"registration_number":"ka-01 ab 1234","vehicle_type":"CAR"}'
+```
+
+The stored form is `KA01AB1234`: surrounding whitespace is trimmed, letters are uppercased, and
+spaces/hyphens are removed. This normalization is not claimed to validate every real-world plate
+format. The owner is always taken from the access token; client-supplied owners are rejected.
+
+```bash
+curl "http://localhost:8000/api/v1/vehicles/?is_active=true" \
+  -H "Authorization: Bearer <access-token>"
+
+curl -X PATCH http://localhost:8000/api/v1/vehicles/1/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_type":"CAR","is_active":false}'
+```
+
+Vehicle ownership means association with an application account, not verified legal ownership.
+The configuration decisions are in
+[ADR 0003](docs/decisions/0003-parking-configuration-and-vehicles.md).
+
+## Vehicle entry and parking-session examples
+
+An ADMIN or OPERATOR can admit any registered active vehicle through an active `ENTRY` or `BOTH`
+gate. The server—not the client—chooses the spot, actor, entry time, initial status, snapshots, and
+ticket reference:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/entry/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":1,"entry_gate_id":1}'
+```
+
+Compatibility is explicit: motorcycle uses motorcycle, car prefers compact then large, and truck
+uses large. Candidates are then ordered by floor level, spot number, and spot ID. Floor level is a
+deterministic rule, not a claim about physical distance from the gate. Repeating a successful entry
+returns `VEHICLE_ALREADY_PARKED` and never creates a second open session.
+
+Customers see only sessions associated with their vehicles; ADMIN and OPERATOR accounts see all:
+
+```bash
+curl "http://localhost:8000/api/v1/parking-sessions/?status=ACTIVE&lot=1&entry_date_from=2026-10-01" \
+  -H "Authorization: Bearer <access-token>"
+```
+
+Only staff may add `vehicle=<id>` to that query. Filters are strict, results are paginated, and
+ordering is newest `entered_at` then ID. No session `PATCH` or `DELETE` API exists in Phase 4.
+
+Any authenticated user can read counts without customer or registration details:
+
+```bash
+curl http://localhost:8000/api/v1/parking-lots/1/availability/ \
+  -H "Authorization: Bearer <access-token>"
+```
+
+`operationally_enabled` counts configured `ENABLED` spots. `occupied` means an open session exists,
+including on a maintenance spot. `available` additionally requires active parents and no open
+session. Availability is informational and never reserves capacity; only transactional entry does.
+
+The entry request path is:
+
+```text
+POST /api/v1/parking-sessions/entry/
+→ JWT authentication and ADMIN/OPERATOR permission
+→ strict serializer accepts only vehicle_id and entry_gate_id
+→ entry service opens one PostgreSQL transaction
+→ repository locks lot → gate → vehicle → selected spot
+→ allocation policy applies compatibility and deterministic preference
+→ service rechecks eligibility and creates ACTIVE session snapshots
+→ PostgreSQL partial unique constraints guard vehicle and spot
+→ safe ticket serializer returns HTTP 201
+```
+
+Lot-row serialization is deliberately correctness-first and limits parallel entry throughput within
+one lot. It can be replaced with finer-grained locking after measurement. The lock protocol,
+partial constraints, updated ER diagram, and sequence diagram are in
+[ADR 0004](docs/decisions/0004-transactional-entry-and-availability.md).
+
 ## Errors
 
 API failures use a consistent envelope. Validation failures include field details:
@@ -171,7 +338,7 @@ API failures use a consistent envelope. Validation failures include field detail
 ```
 
 Invalid input returns 400, missing/invalid authentication 401, insufficient application authority
-403, and missing resources 404.
+403, missing resources 404, and known normalized uniqueness conflicts 409.
 
 ## Tests and quality checks
 
