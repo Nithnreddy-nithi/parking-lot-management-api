@@ -1,9 +1,9 @@
 # Parking Lot Management API
 
 A Django 5.2 LTS and Django REST Framework modular monolith running on Python 3.12 and PostgreSQL.
-Phase 5 adds immutable pricing versions, entry-time pricing snapshots, deterministic hourly billing,
-and frozen checkout quotes to the existing transactional entry system. Payments, vehicle exit,
-refunds, Redis, and Celery remain outside this phase.
+Phase 6 adds simulated payments, settlement, zero-charge handling, and atomic vehicle exit to the
+existing transactional entry and frozen-pricing workflow. Real gateways, webhooks, refunds, Redis,
+and Celery remain outside this phase.
 
 Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is available at
 `/api/v1/schema/`.
@@ -18,13 +18,15 @@ Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is
 - `apps/accounts/permissions.py`: reusable application-role authorization.
 - `apps/parking/`: constrained parking models, configuration/vehicle APIs, selectors, services, and
   the idempotent demo-data command.
-- `apps/sessions/`: session lifecycle data, allocation policy, locking repository, entry service,
-  checkout coordination, scoped read selectors, availability aggregation, APIs, and concurrency
+- `apps/sessions/`: session lifecycle data, allocation policy, locking repository, entry, checkout,
+  and exit coordination, scoped read selectors, availability aggregation, APIs, and concurrency
   tests.
 - `apps/pricing/`: versioned policies, immutable snapshots and quotes, pure fee calculators,
   pricing-management APIs, selectors, and legacy backfill tooling.
+- `apps/payments/`: payment attempts, immutable settlements, provider protocol, persistent simulated
+  adapter, transaction services, reconciliation command, scoped APIs, and concurrency tests.
 - `apps/<module>/`: accounts, parking, sessions, pricing, payments, reporting, and audit boundaries.
-  Payments, reporting, and audit remain intentional skeletons for later phases.
+  Reporting and audit remain intentional skeletons for later phases.
 - `tests/` and application `tests/` packages: PostgreSQL model, API, authentication, authorization,
   ownership, constraint, and query-count tests.
 - `docs/decisions/`: architecture and collaboration decisions.
@@ -64,6 +66,10 @@ Django flag. A PostgreSQL check constraint accepts only `ADMIN`, `OPERATOR`, or 
 | Pricing policy management | Read/write | No | No |
 | Checkout | Yes | Yes | No |
 | Quote reads | All | All | Own vehicles only |
+| Initiate payment | All sessions | All sessions | Own vehicles only |
+| Settle zero quote | All sessions | All sessions | Own vehicles only |
+| Payment reads | All | All | Own vehicles only |
+| Record exit | Yes | Yes | No |
 
 Django superusers retain the documented configuration override. Vehicle access remains owner-scoped
 even for ADMIN and OPERATOR accounts. A cross-owner vehicle ID returns 404 rather than revealing that
@@ -298,7 +304,7 @@ curl "http://localhost:8000/api/v1/parking-sessions/?status=ACTIVE&lot=1&entry_d
 ```
 
 Only staff may add `vehicle=<id>` to that query. Filters are strict, results are paginated, and
-ordering is newest `entered_at` then ID. No session `PATCH` or `DELETE` API exists in Phase 4.
+ordering is newest `entered_at` then ID. No session `PATCH` or `DELETE` API exists.
 
 Any authenticated user can read counts without customer or registration details:
 
@@ -362,7 +368,7 @@ the daily cap to consecutive 24-hour blocks from entry. It creates one immutable
 does not continue accruing after checkout in this product version.
 
 Checkout does not close the session, set `closed_at`, mark it paid, or release its spot. A
-zero-charge quote also remains `PAYMENT_PENDING` until Phase 6 defines settlement.
+zero-charge quote remains `PAYMENT_PENDING` until the explicit zero-charge settlement operation.
 
 Customers can read a quote only for their own session:
 
@@ -382,6 +388,114 @@ docker compose exec web python manage.py backfill_pricing_snapshots `
 The command is idempotent and never overwrites a snapshot. Until backfilled, checkout returns
 `SESSION_PRICING_NOT_CONFIGURED`. Pricing decisions, the updated ER diagram, and checkout sequence
 are in [ADR 0005](docs/decisions/0005-versioned-pricing-and-checkout.md).
+
+## Simulated payments, settlement, and exit
+
+A payment attempt records one interaction with the configured provider. A settlement is the single
+authoritative proof that the frozen quote has been paid. Failed attempts remain as history, while a
+quote has at most one successful attempt and one settlement. Clients supply only the parking
+session ID; amount, currency, merchant reference, and status are server-controlled.
+
+The local simulator is persistent in PostgreSQL rather than process memory, so repeated HTTP
+requests and different web workers observe the same provider-side result for an attempt UUID. Set
+`SIMULATED_PAYMENT_SCENARIO` in `.env` to `SUCCESS`, `FAILURE`, `PENDING`, or
+`TIMEOUT_AFTER_SUCCESS`, then restart the web process. This development control is never accepted
+from the public payment API.
+
+Initiate or reuse a payment for a positive frozen quote:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/payments/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"parking_session_id":1}'
+```
+
+The service uses three boundaries:
+
+```text
+transaction 1: lock session → quote; create or reuse PENDING attempt; commit
+outside transaction: call provider using attempt UUID as stable merchant reference
+transaction 2: lock session → quote → attempt; validate result; settle and mark PAID; commit
+```
+
+No database lock is held across a provider call. A timeout is ambiguous: the provider may have
+charged successfully even though the application received no response. The attempt therefore stays
+`PENDING`; it is never treated as a confirmed failure or retried under a new merchant reference.
+Recover the recorded simulator result through the same result-processing service:
+
+```powershell
+docker compose exec web python manage.py reconcile_payment <attempt-uuid>
+```
+
+For a quote whose frozen amount is exactly zero, settle without creating an attempt or contacting a
+provider:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/settle-zero/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+After settlement the session is `PAID`, but its spot remains occupied. Only an ADMIN or OPERATOR can
+record physical exit through an active `EXIT` or `BOTH` gate in the same lot:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/exit/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"exit_gate_id":2}'
+```
+
+Exit locks session → gate → spot → quote → settlement → optional attempt, validates settlement,
+records the immutable exit gate, actor, and timestamp, and changes `PAID` to `CLOSED` atomically.
+Occupancy is derived from open session statuses, so no second occupied flag can drift. A disabled lot
+or floor and a maintenance spot do not trap an already-paid vehicle; only the selected exit gate
+must remain active and compatible.
+
+### Reproducible local lifecycle demo
+
+After setup, migrations, administrator creation, demo seeding, customer/vehicle creation, and token
+acquisition, substitute the returned IDs in this sequence:
+
+```bash
+# 1. Observe initial capacity.
+curl http://localhost:8000/api/v1/parking-lots/1/availability/ \
+  -H "Authorization: Bearer <operator-access-token>"
+
+# 2. Entry creates ACTIVE session and pricing snapshot.
+curl -X POST http://localhost:8000/api/v1/parking-sessions/entry/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":1,"entry_gate_id":1}'
+
+# 3. Checkout freezes quote and changes ACTIVE → PAYMENT_PENDING.
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/checkout/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" -d '{}'
+
+# 4. Default SUCCESS simulator settles quote and changes PAYMENT_PENDING → PAID.
+curl -X POST http://localhost:8000/api/v1/payments/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" -d '{"parking_session_id":1}'
+
+# 5. Exit changes PAID → CLOSED and releases derived occupancy.
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/exit/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" -d '{"exit_gate_id":2}'
+
+# 6. Availability increases after CLOSED releases the spot.
+curl http://localhost:8000/api/v1/parking-lots/1/availability/ \
+  -H "Authorization: Bearer <operator-access-token>"
+```
+
+The migration adding exit attribution intentionally fails if historical `CLOSED` rows exist without
+verified exit gate and actor data. Export and resolve those records using operational evidence before
+retrying migration; the project never fabricates audit metadata. Full payment decisions, transaction
+boundaries, ER and lifecycle diagrams are in
+[ADR 0006](docs/decisions/0006-simulated-payments-settlement-and-exit.md). Simulator guarantees are
+test/dev guarantees only and are not evidence of real-provider behavior or certification.
 
 ## Errors
 

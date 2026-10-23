@@ -5,8 +5,10 @@ from apps.sessions.api.views import (
     ParkingEntryView,
     ParkingSessionCheckoutView,
     ParkingSessionDetailView,
+    ParkingSessionExitView,
     ParkingSessionListView,
     ParkingSessionQuoteView,
+    ParkingSessionZeroSettlementView,
 )
 
 urlpatterns = [
@@ -30,6 +32,16 @@ urlpatterns = [
         "parking-sessions/<int:pk>/quote/",
         ParkingSessionQuoteView.as_view(),
         name="parking-session-quote",
+    ),
+    path(
+        "parking-sessions/<int:pk>/settle-zero/",
+        ParkingSessionZeroSettlementView.as_view(),
+        name="parking-session-settle-zero",
+    ),
+    path(
+        "parking-sessions/<int:pk>/exit/",
+        ParkingSessionExitView.as_view(),
+        name="parking-session-exit",
     ),
     path(
         "parking-lots/<int:pk>/availability/",

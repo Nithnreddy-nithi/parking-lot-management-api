@@ -23,6 +23,8 @@ def session_list(
         "spot__floor",
         "spot__floor__parking_lot",
         "entry_gate",
+        "exit_gate",
+        "exited_by",
     )
     if owner_id is not None:
         queryset = queryset.filter(vehicle__owner_id=owner_id)

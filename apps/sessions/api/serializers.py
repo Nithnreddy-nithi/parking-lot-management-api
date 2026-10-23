@@ -10,6 +10,10 @@ class EntryRequestSerializer(StrictInputMixin, serializers.Serializer):
     entry_gate_id = serializers.IntegerField(min_value=1)
 
 
+class ExitRequestSerializer(StrictInputMixin, serializers.Serializer):
+    exit_gate_id = serializers.IntegerField(min_value=1)
+
+
 class ParkingSessionOutputSerializer(serializers.ModelSerializer):
     vehicle_registration = serializers.CharField(
         source="registration_number_snapshot", read_only=True
@@ -24,6 +28,9 @@ class ParkingSessionOutputSerializer(serializers.ModelSerializer):
     spot_type = serializers.CharField(source="spot.spot_type", read_only=True)
     entry_gate_id = serializers.IntegerField(source="entry_gate.id", read_only=True)
     entry_gate_code = serializers.CharField(source="entry_gate.code", read_only=True)
+    exit_gate_id = serializers.IntegerField(source="exit_gate.id", read_only=True)
+    exit_gate_code = serializers.CharField(source="exit_gate.code", read_only=True)
+    exited_by = serializers.IntegerField(source="exited_by_id", read_only=True)
 
     class Meta:
         model = ParkingSession
@@ -41,6 +48,9 @@ class ParkingSessionOutputSerializer(serializers.ModelSerializer):
             "spot_type",
             "entry_gate_id",
             "entry_gate_code",
+            "exit_gate_id",
+            "exit_gate_code",
+            "exited_by",
             "entered_at",
             "closed_at",
             "status",

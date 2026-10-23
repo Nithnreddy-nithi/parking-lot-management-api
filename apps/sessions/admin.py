@@ -10,6 +10,7 @@ class ParkingSessionAdmin(admin.ModelAdmin):
         "vehicle",
         "spot",
         "entry_gate",
+        "exit_gate",
         "status",
         "entered_at",
     )
@@ -20,6 +21,9 @@ class ParkingSessionAdmin(admin.ModelAdmin):
         "entered_at",
         "registration_number_snapshot",
         "vehicle_type_snapshot",
+        "exit_gate",
+        "exited_by",
+        "closed_at",
         "created_at",
         "updated_at",
     )

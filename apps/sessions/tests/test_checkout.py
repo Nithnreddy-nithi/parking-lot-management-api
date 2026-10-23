@@ -176,7 +176,14 @@ def test_checkout_rejects_inconsistent_or_unsupported_states(
 ):
     session = entered_session(operator=operator, vehicle=vehicle, entry_gate=entry_gate)
     closed_at = CHECKOUT_TIME if status == SessionStatus.CLOSED else None
-    ParkingSession.objects.filter(pk=session.pk).update(status=status, closed_at=closed_at)
+    exit_metadata = (
+        {"exit_gate": entry_gate, "exited_by": operator} if status == SessionStatus.CLOSED else {}
+    )
+    ParkingSession.objects.filter(pk=session.pk).update(
+        status=status,
+        closed_at=closed_at,
+        **exit_metadata,
+    )
     if with_quote:
         CheckoutQuote.objects.create(
             parking_session=session,
