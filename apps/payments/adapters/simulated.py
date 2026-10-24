@@ -13,6 +13,8 @@ from apps.payments.models import SimulatedPaymentRecord
 class SimulatedPaymentProvider:
     """Deterministic, database-backed simulator suitable for multi-request local demos."""
 
+    name = "SIMULATED"
+
     def _scenario(self) -> str:
         scenario = getattr(settings, "SIMULATED_PAYMENT_SCENARIO", SimulationScenario.SUCCESS)
         if scenario not in SimulationScenario.values:
@@ -80,9 +82,27 @@ class SimulatedPaymentProvider:
             raise ProviderOutcomeUnknown("The simulated response timed out after success.")
         return result
 
-    def retrieve_payment(self, *, merchant_reference: UUID) -> ProviderPaymentResult:
+    def retrieve_payment(
+        self,
+        *,
+        merchant_reference: UUID,
+        provider_order_reference: str | None = None,
+        provider_reference: str | None = None,
+    ) -> ProviderPaymentResult:
         try:
             record = SimulatedPaymentRecord.objects.get(merchant_reference=merchant_reference)
         except SimulatedPaymentRecord.DoesNotExist as exc:
             raise ProviderProtocolError("The simulator has no record for this payment.") from exc
         return self._result(record)
+
+    def verify_checkout_signature(self, **kwargs) -> None:
+        raise ProviderProtocolError("Checkout signatures are not used by the simulator.")
+
+    def verify_webhook_signature(self, **kwargs) -> None:
+        raise ProviderProtocolError("Webhooks are not used by the simulator.")
+
+    def initiate_refund(self, **kwargs):
+        raise ProviderProtocolError("Refunds are only supported by the Razorpay adapter.")
+
+    def retrieve_refund(self, **kwargs):
+        raise ProviderProtocolError("Refunds are only supported by the Razorpay adapter.")

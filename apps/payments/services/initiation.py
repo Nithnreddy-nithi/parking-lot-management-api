@@ -42,8 +42,8 @@ class PaymentInitiationService:
             ) from exc
         return self.result_service.apply(attempt_id=attempt.pk, result=result)
 
-    @staticmethod
-    def _prepare(*, session_id: int, actor) -> tuple[PaymentAttempt, bool]:
+    def _prepare(self, *, session_id: int, actor) -> tuple[PaymentAttempt, bool]:
+        provider_name = getattr(self.provider, "name", PaymentProviderName.SIMULATED)
         with transaction.atomic():
             try:
                 parking_session = ParkingSession.objects.select_for_update().get(pk=session_id)
@@ -85,11 +85,19 @@ class PaymentInitiationService:
                 status=PaymentStatus.PENDING,
             ).first()
             if pending is not None:
-                return pending, True
+                if pending.provider != provider_name:
+                    raise PaymentConflict(
+                        code="PAYMENT_PROVIDER_CHANGED",
+                        detail=(
+                            "Finish or reconcile the existing payment with its original provider."
+                        ),
+                    )
+                # A Razorpay order is created once. Checkout and reconciliation reuse it.
+                return pending, pending.provider == PaymentProviderName.SIMULATED
 
             attempt = PaymentAttempt.objects.create(
                 quote=quote,
-                provider=PaymentProviderName.SIMULATED,
+                provider=provider_name,
                 amount=quote.amount,
                 currency=quote.currency,
                 initiated_by=actor,

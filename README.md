@@ -1,9 +1,10 @@
 # Parking Lot Management API
 
 A Django 5.2 LTS and Django REST Framework modular monolith running on Python 3.12 and PostgreSQL.
-Phase 6 adds simulated payments, settlement, zero-charge handling, and atomic vehicle exit to the
-existing transactional entry and frozen-pricing workflow. Real gateways, webhooks, refunds, Redis,
-and Celery remain outside this phase.
+Phase 6 provides payment settlement and atomic vehicle exit. The payment boundary now supports both
+the persistent local simulator and Razorpay Standard Checkout, including signed confirmation,
+verified idempotent webhooks, reconciliation, and full or partial refunds. Redis and Celery remain
+outside the current scope.
 
 Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is available at
 `/api/v1/schema/`.
@@ -23,8 +24,8 @@ Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is
   tests.
 - `apps/pricing/`: versioned policies, immutable snapshots and quotes, pure fee calculators,
   pricing-management APIs, selectors, and legacy backfill tooling.
-- `apps/payments/`: payment attempts, immutable settlements, provider protocol, persistent simulated
-  adapter, transaction services, reconciliation command, scoped APIs, and concurrency tests.
+- `apps/payments/`: payment attempts, immutable settlements, refund ledger, provider protocol,
+  simulator and Razorpay adapters, signed webhook handling, reconciliation, scoped APIs, and tests.
 - `apps/<module>/`: accounts, parking, sessions, pricing, payments, reporting, and audit boundaries.
   Reporting and audit remain intentional skeletons for later phases.
 - `tests/` and application `tests/` packages: PostgreSQL model, API, authentication, authorization,
@@ -69,6 +70,8 @@ Django flag. A PostgreSQL check constraint accepts only `ADMIN`, `OPERATOR`, or 
 | Initiate payment | All sessions | All sessions | Own vehicles only |
 | Settle zero quote | All sessions | All sessions | Own vehicles only |
 | Payment reads | All | All | Own vehicles only |
+| Refund reads | All | All | Own payments only |
+| Issue refund | Yes | No | No |
 | Record exit | Yes | Yes | No |
 
 Django superusers retain the documented configuration override. Vehicle access remains owner-scoped
@@ -389,7 +392,7 @@ The command is idempotent and never overwrites a snapshot. Until backfilled, che
 `SESSION_PRICING_NOT_CONFIGURED`. Pricing decisions, the updated ER diagram, and checkout sequence
 are in [ADR 0005](docs/decisions/0005-versioned-pricing-and-checkout.md).
 
-## Simulated payments, settlement, and exit
+## Payments, settlement, refunds, and exit
 
 A payment attempt records one interaction with the configured provider. A settlement is the single
 authoritative proof that the frozen quote has been paid. Failed attempts remain as history, while a
@@ -402,6 +405,38 @@ requests and different web workers observe the same provider-side result for an 
 `TIMEOUT_AFTER_SUCCESS`, then restart the web process. This development control is never accepted
 from the public payment API.
 
+### Razorpay Test Mode configuration
+
+The backend integrates Razorpay through the official Python SDK. It creates a Razorpay Order; card,
+UPI, wallet, and bank credentials stay inside Razorpay Standard Checkout and never pass through this
+API. Start in Razorpay **Test Mode**, create API keys and a separate webhook secret, then set:
+
+```dotenv
+PAYMENT_PROVIDER=RAZORPAY
+RAZORPAY_KEY_ID=rzp_test_replace_me
+RAZORPAY_KEY_SECRET=replace_me
+RAZORPAY_WEBHOOK_SECRET=replace_me_with_a_different_secret
+```
+
+Rebuild after adding the SDK, then restart the services:
+
+```powershell
+docker compose up --build -d
+docker compose exec web python manage.py migrate
+```
+
+Configure this HTTPS webhook URL in the Razorpay Dashboard:
+
+```text
+https://<your-host>/api/v1/payments/webhooks/razorpay/
+```
+
+Subscribe to `payment.captured`, `payment.failed`, `refund.created`, `refund.processed`, and
+`refund.failed` where available. The handler validates `X-Razorpay-Signature` against the exact raw
+request body, requires `X-Razorpay-Event-Id`, and stores only event metadata plus a SHA-256 payload
+digest—not card data or the full webhook payload. Test and live dashboard modes need separate keys
+and webhook configuration.
+
 Initiate or reuse a payment for a positive frozen quote:
 
 ```bash
@@ -410,6 +445,21 @@ curl -X POST http://localhost:8000/api/v1/payments/ \
   -H "Content-Type: application/json" \
   -d '{"parking_session_id":1}'
 ```
+
+With Razorpay selected, a pending response includes the safe public `checkout_key_id` and
+`provider_order_reference`. Pass those values, amount, and currency to Razorpay Standard Checkout.
+After Checkout returns its three signed values, confirm them server-side:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/payments/<attempt-uuid>/confirm/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"razorpay_order_id":"order_...","razorpay_payment_id":"pay_...","razorpay_signature":"..."}'
+```
+
+Signature verification alone does not settle the quote. The adapter fetches the payment from
+Razorpay and requires `captured` status with the exact frozen amount, currency, order, and merchant
+reference. Webhooks provide the durable path if the browser closes before confirmation.
 
 The service uses three boundaries:
 
@@ -427,6 +477,31 @@ Recover the recorded simulator result through the same result-processing service
 ```powershell
 docker compose exec web python manage.py reconcile_payment <attempt-uuid>
 ```
+
+For a Razorpay order-creation timeout, reconciliation searches by the unique receipt derived from
+the unchanged attempt UUID, saves the recovered order ID, and then retrieves its payment. It never
+creates a new merchant reference for an uncertain result.
+
+Only an ADMIN can request a partial or full refund. Pending refunds reserve their amount under a
+settlement row lock, preventing concurrent requests from exceeding the captured payment:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/refunds/ \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"payment_attempt_id":"<attempt-uuid>","amount":"25.00","reason":"Approved adjustment"}'
+```
+
+Reconcile a known pending provider refund with:
+
+```powershell
+docker compose exec web python manage.py reconcile_refund <refund-uuid>
+```
+
+Refunds do not delete or mutate the original settlement and do not reopen a `PAID` or `CLOSED`
+parking session. If a refund-create response is lost before the provider refund ID is stored, locate
+the operation in the Razorpay Dashboard using the refund UUID in `notes` before reconciling; blindly
+reissuing it could duplicate money movement.
 
 For a quote whose frozen amount is exactly zero, settle without creating an attempt or contacting a
 provider:
@@ -496,6 +571,8 @@ retrying migration; the project never fabricates audit metadata. Full payment de
 boundaries, ER and lifecycle diagrams are in
 [ADR 0006](docs/decisions/0006-simulated-payments-settlement-and-exit.md). Simulator guarantees are
 test/dev guarantees only and are not evidence of real-provider behavior or certification.
+Razorpay-specific trust boundaries, failure handling, refunds, and webhook decisions are in
+[ADR 0007](docs/decisions/0007-razorpay-payments-webhooks-and-refunds.md).
 
 ## Errors
 

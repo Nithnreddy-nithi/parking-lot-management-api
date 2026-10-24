@@ -80,17 +80,32 @@ class PaymentResultService:
                 return attempt
 
             if result.status == PaymentStatus.PENDING:
-                if attempt.provider_reference not in {None, result.provider_reference}:
+                if result.provider_reference and attempt.provider_reference not in {
+                    None,
+                    result.provider_reference,
+                }:
                     raise PaymentConflict(
                         code="PROVIDER_RESULT_CONFLICT",
                         detail="The provider reference contradicts the existing attempt.",
                     )
                 attempt.provider_reference = result.provider_reference
-                attempt.save(update_fields=["provider_reference", "updated_at"])
+                attempt.provider_order_reference = (
+                    result.provider_order_reference or attempt.provider_order_reference
+                )
+                attempt.save(
+                    update_fields=[
+                        "provider_reference",
+                        "provider_order_reference",
+                        "updated_at",
+                    ]
+                )
                 return attempt
 
             completed_at = self.clock()
             attempt.provider_reference = result.provider_reference
+            attempt.provider_order_reference = (
+                result.provider_order_reference or attempt.provider_order_reference
+            )
             attempt.status = result.status
             attempt.completed_at = completed_at
             attempt.failure_code = (
@@ -101,6 +116,7 @@ class PaymentResultService:
             attempt.save(
                 update_fields=[
                     "provider_reference",
+                    "provider_order_reference",
                     "status",
                     "completed_at",
                     "failure_code",
@@ -146,7 +162,15 @@ class PaymentResultService:
                 code="PROVIDER_FINANCIAL_MISMATCH",
                 detail="The provider result does not match the attempted amount and currency.",
             )
-        if not result.provider_reference:
+        if result.provider_order_reference and attempt.provider_order_reference not in {
+            None,
+            result.provider_order_reference,
+        }:
+            raise PaymentConflict(
+                code="PROVIDER_ORDER_MISMATCH",
+                detail="The provider returned a different order reference.",
+            )
+        if result.status != PaymentStatus.PENDING and not result.provider_reference:
             raise PaymentConflict(
                 code="INVALID_PROVIDER_RESULT",
                 detail="The provider result has no provider reference.",
@@ -159,6 +183,7 @@ class PaymentResultService:
         identical = (
             attempt.status == result.status
             and attempt.provider_reference == result.provider_reference
+            and attempt.provider_order_reference == result.provider_order_reference
             and (
                 attempt.status != PaymentStatus.FAILED
                 or attempt.failure_code == (result.failure_code or "PROVIDER_DECLINED")

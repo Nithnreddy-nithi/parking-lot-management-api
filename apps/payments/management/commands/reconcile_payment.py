@@ -1,13 +1,12 @@
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.payments.adapters.simulated import SimulatedPaymentProvider
-from apps.payments.composition import build_payment_result_service
-from apps.payments.exceptions import PaymentConflict, ProviderProtocolError
+from apps.payments.composition import build_payment_provider, build_payment_result_service
+from apps.payments.exceptions import PaymentConflict, ProviderOutcomeUnknown, ProviderProtocolError
 from apps.payments.models import PaymentAttempt
 
 
 class Command(BaseCommand):
-    help = "Retrieve and safely apply the simulator result for one payment attempt."
+    help = "Retrieve and safely apply the configured provider result for one payment attempt."
 
     def add_arguments(self, parser):
         parser.add_argument("attempt_id")
@@ -20,12 +19,17 @@ class Command(BaseCommand):
             raise CommandError("Payment attempt not found.") from exc
 
         try:
-            result = SimulatedPaymentProvider().retrieve_payment(merchant_reference=attempt.pk)
+            provider = build_payment_provider(attempt.provider)
+            result = provider.retrieve_payment(
+                merchant_reference=attempt.pk,
+                provider_order_reference=attempt.provider_order_reference,
+                provider_reference=attempt.provider_reference,
+            )
             updated = build_payment_result_service().apply(
                 attempt_id=attempt.pk,
                 result=result,
             )
-        except (ProviderProtocolError, PaymentConflict) as exc:
+        except (ProviderOutcomeUnknown, ProviderProtocolError, PaymentConflict) as exc:
             raise CommandError(str(exc)) from exc
 
         self.stdout.write(self.style.SUCCESS(f"Payment {updated.pk} is {updated.status}."))

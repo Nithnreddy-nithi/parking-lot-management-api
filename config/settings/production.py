@@ -37,6 +37,14 @@ DATABASES["default"].update(  # noqa: F405
 )
 
 DEBUG = False
+
+PAYMENT_PROVIDER = required_environment("PAYMENT_PROVIDER")
+if PAYMENT_PROVIDER not in {"SIMULATED", "RAZORPAY"}:
+    raise ImproperlyConfigured("PAYMENT_PROVIDER must be SIMULATED or RAZORPAY")
+if PAYMENT_PROVIDER == "RAZORPAY":
+    RAZORPAY_KEY_ID = required_environment("RAZORPAY_KEY_ID")
+    RAZORPAY_KEY_SECRET = required_environment("RAZORPAY_KEY_SECRET")
+    RAZORPAY_WEBHOOK_SECRET = required_environment("RAZORPAY_WEBHOOK_SECRET")
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",")

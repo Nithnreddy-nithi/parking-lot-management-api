@@ -1,6 +1,12 @@
 from django.contrib import admin
 
-from apps.payments.models import PaymentAttempt, Settlement, SimulatedPaymentRecord
+from apps.payments.models import (
+    PaymentAttempt,
+    Refund,
+    Settlement,
+    SimulatedPaymentRecord,
+    WebhookEvent,
+)
 
 
 @admin.register(PaymentAttempt)
@@ -28,6 +34,28 @@ class SettlementAdmin(admin.ModelAdmin):
 class SimulatedPaymentRecordAdmin(admin.ModelAdmin):
     list_display = ("merchant_reference", "status", "scenario", "updated_at")
     readonly_fields = tuple(field.name for field in SimulatedPaymentRecord._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(Refund)
+class RefundAdmin(admin.ModelAdmin):
+    list_display = ("id", "settlement", "amount", "currency", "status", "created_at")
+    list_filter = ("status", "currency")
+    search_fields = ("id", "provider_reference")
+    readonly_fields = tuple(field.name for field in Refund._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(WebhookEvent)
+class WebhookEventAdmin(admin.ModelAdmin):
+    list_display = ("provider_event_id", "event_type", "status", "received_at")
+    list_filter = ("provider", "status", "event_type")
+    search_fields = ("provider_event_id",)
+    readonly_fields = tuple(field.name for field in WebhookEvent._meta.fields)
 
     def has_add_permission(self, request):
         return False
