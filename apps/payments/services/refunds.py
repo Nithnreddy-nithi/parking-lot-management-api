@@ -18,12 +18,15 @@ class RefundResultService:
 
     def apply(self, *, refund_id, result: ProviderRefundResult) -> Refund:
         with transaction.atomic():
-            refund = (
-                Refund.objects.select_for_update()
-                .select_related("settlement__payment_attempt")
-                .get(pk=refund_id)
+            identifiers = Refund.objects.values(
+                "settlement_id",
+                "settlement__payment_attempt_id",
+            ).get(pk=refund_id)
+            Settlement.objects.select_for_update().get(pk=identifiers["settlement_id"])
+            attempt = PaymentAttempt.objects.select_for_update().get(
+                pk=identifiers["settlement__payment_attempt_id"]
             )
-            attempt = refund.settlement.payment_attempt
+            refund = Refund.objects.select_for_update().get(pk=refund_id)
             if (
                 result.merchant_reference != refund.pk
                 or result.payment_reference != attempt.provider_reference
@@ -148,3 +151,4 @@ class RefundInitiationService:
                 reason=reason,
                 requested_by=actor,
             )
+
