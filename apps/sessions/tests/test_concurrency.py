@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
 
 import pytest
@@ -10,8 +11,10 @@ from apps.accounts.models import User
 from apps.parking.enums import GateType, SpotType, VehicleType
 from apps.parking.models import Floor, Gate, ParkingLot, ParkingSpot, Vehicle
 from apps.parking.services.configuration import update_parking_spot
+from apps.pricing.calculators import resolve_calculator
+from apps.pricing.models import CheckoutQuote, PricingPolicy
 from apps.sessions.models import ParkingSession
-from apps.sessions.services import build_entry_service
+from apps.sessions.services import CheckoutService, build_entry_service
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -68,6 +71,15 @@ def concurrent_setup():
         gate_type=GateType.ENTRY,
     )
     spot = ParkingSpot.objects.create(floor=floor, number="C-1", spot_type=SpotType.COMPACT)
+    PricingPolicy.objects.create(
+        parking_lot=lot,
+        vehicle_type=VehicleType.CAR,
+        version=1,
+        hourly_rate="30.00",
+        grace_minutes=15,
+        daily_cap="300.00",
+        created_by=operator,
+    )
     return operator, customer, lot, floor, gate, spot
 
 
@@ -116,6 +128,15 @@ def test_same_vehicle_cannot_enter_two_lots_simultaneously(concurrent_setup):
         gate_type=GateType.ENTRY,
     )
     ParkingSpot.objects.create(floor=second_floor, number="C-1", spot_type=SpotType.COMPACT)
+    PricingPolicy.objects.create(
+        parking_lot=second_lot,
+        vehicle_type=VehicleType.CAR,
+        version=1,
+        hourly_rate="30.00",
+        grace_minutes=15,
+        daily_cap="300.00",
+        created_by=operator,
+    )
     vehicle = Vehicle.objects.create(
         owner=customer, registration_number="CROSSLOT", vehicle_type=VehicleType.CAR
     )
@@ -159,3 +180,36 @@ def test_spot_type_mutation_racing_entry_preserves_invariants(concurrent_setup):
         assert spot.spot_type == SpotType.MOTORCYCLE
         assert any(result[0] == "conflict" for result in results)
     assert db.connections["default"].in_atomic_block is False
+
+
+def test_concurrent_checkout_returns_one_persisted_quote(concurrent_setup):
+    operator, customer, _lot, _floor, gate, _spot = concurrent_setup
+    vehicle = Vehicle.objects.create(
+        owner=customer,
+        registration_number="CHECKOUTRACE",
+        vehicle_type=VehicleType.CAR,
+    )
+    session = build_entry_service().enter(
+        vehicle_id=vehicle.pk,
+        entry_gate_id=gate.pk,
+        actor=operator,
+    )
+    calculated_until = datetime(2026, 2, 2, tzinfo=UTC)
+    ParkingSession.objects.filter(pk=session.pk).update(
+        entered_at=calculated_until - timedelta(hours=2)
+    )
+
+    def checkout_worker():
+        actor = User.objects.get(pk=operator.pk)
+        quote = CheckoutService(
+            calculator_resolver=resolve_calculator,
+            clock=lambda: calculated_until,
+        ).checkout(session_id=session.pk, actor=actor)
+        return ("quoted", quote.pk)
+
+    results = _run_workers(checkout_worker, checkout_worker)
+
+    assert not [result for result in results if result[0] == "worker_error"]
+    assert [result[0] for result in results] == ["quoted", "quoted"]
+    assert len({result[1] for result in results}) == 1
+    assert CheckoutQuote.objects.filter(parking_session=session).count() == 1

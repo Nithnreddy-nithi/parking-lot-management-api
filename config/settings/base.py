@@ -120,11 +120,23 @@ SPECTACULAR_SETTINGS = {
         "Parking Lot Management modular-monolith API. Authenticate with a JWT Bearer access token "
         "for protected operations."
     ),
-    "VERSION": "4.0.0",
+    "VERSION": "6.1.0",
     "SERVE_PERMISSIONS": ["rest_framework.permissions.AllowAny"],
     "ENUM_NAME_OVERRIDES": {
         "UserRole": "apps.accounts.models.User.Role",
         "ManageableUserRole": ["CUSTOMER", "OPERATOR"],
         "ParkingSessionStatus": "apps.sessions.enums.SessionStatus",
+        "PricingCurrency": "apps.pricing.enums.Currency",
+        "PricingCalculatorVersion": "apps.pricing.enums.CalculatorVersion",
+        "PaymentStatus": "apps.payments.enums.PaymentStatus",
+        "PaymentProvider": "apps.payments.enums.PaymentProviderName",
+        "SettlementMethod": "apps.payments.enums.SettlementMethod",
+        "WebhookEventStatus": "apps.payments.enums.WebhookEventStatus",
     },
 }
+
+SIMULATED_PAYMENT_SCENARIO = os.getenv("SIMULATED_PAYMENT_SCENARIO", "SUCCESS")
+PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "SIMULATED")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")

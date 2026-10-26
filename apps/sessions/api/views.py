@@ -12,14 +12,20 @@ from rest_framework.views import APIView
 from apps.accounts.models import User
 from apps.accounts.permissions import IsAdminOrOperatorRole
 from apps.parking.models import ParkingLot
+from apps.payments.api.serializers import EmptySettlementSerializer, SettlementOutputSerializer
+from apps.payments.composition import build_zero_charge_settlement_service
+from apps.pricing.api.serializers import CheckoutQuoteOutputSerializer, EmptyCheckoutSerializer
+from apps.pricing.exceptions import QuoteNotFound
+from apps.pricing.selectors import quote_for_session
 from apps.sessions.api.serializers import (
     AvailabilitySerializer,
     EntryRequestSerializer,
+    ExitRequestSerializer,
     ParkingSessionOutputSerializer,
     SessionFilterSerializer,
 )
 from apps.sessions.selectors import availability_by_spot_type, session_list
-from apps.sessions.services import build_entry_service
+from apps.sessions.services import build_checkout_service, build_entry_service, build_exit_service
 
 
 class SessionPagination(PageNumberPagination):
@@ -117,6 +123,105 @@ class ParkingSessionDetailView(APIView):
     def get(self, request: Request, pk: int) -> Response:
         owner_id = None if _is_staff_reader(request.user) else request.user.pk
         parking_session = get_object_or_404(session_list(owner_id=owner_id), pk=pk)
+        return Response(ParkingSessionOutputSerializer(parking_session).data)
+
+
+class ParkingSessionCheckoutView(APIView):
+    permission_classes = [IsAdminOrOperatorRole]
+
+    @extend_schema(
+        request=EmptyCheckoutSerializer,
+        responses={
+            200: CheckoutQuoteOutputSerializer,
+            409: OpenApiResponse(description="Pricing or session-state business conflict."),
+        },
+        description=(
+            "ADMIN or OPERATOR only. Atomically freezes the fee quote and transitions ACTIVE to "
+            "PAYMENT_PENDING. Repeated checkout returns the original quote."
+        ),
+        tags=["Parking sessions"],
+    )
+    def post(self, request: Request, pk: int) -> Response:
+        serializer = EmptyCheckoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        quote = build_checkout_service().checkout(session_id=pk, actor=request.user)
+        return Response(CheckoutQuoteOutputSerializer(quote).data)
+
+
+class ParkingSessionQuoteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: CheckoutQuoteOutputSerializer},
+        description=(
+            "ADMIN and OPERATOR may read all quotes. Customers may read only quotes for sessions "
+            "associated with their vehicles."
+        ),
+        tags=["Parking sessions"],
+    )
+    def get(self, request: Request, pk: int) -> Response:
+        owner_id = None if _is_staff_reader(request.user) else request.user.pk
+        parking_session = get_object_or_404(session_list(owner_id=owner_id), pk=pk)
+        quote = quote_for_session(session_id=parking_session.pk)
+        if quote is None:
+            raise QuoteNotFound()
+        return Response(CheckoutQuoteOutputSerializer(quote).data)
+
+
+class ParkingSessionZeroSettlementView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=EmptySettlementSerializer,
+        responses={
+            200: SettlementOutputSerializer,
+            409: OpenApiResponse(description="Settlement or session-state conflict."),
+        },
+        description=(
+            "Settles a zero-amount frozen quote without creating a payment attempt or contacting "
+            "the provider. Customers may settle only their own sessions."
+        ),
+        tags=["Payments"],
+    )
+    def post(self, request: Request, pk: int) -> Response:
+        serializer = EmptySettlementSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        owner_id = None if _is_staff_reader(request.user) else request.user.pk
+        get_object_or_404(session_list(owner_id=owner_id), pk=pk)
+        settlement = build_zero_charge_settlement_service().settle(session_id=pk)
+        return Response(SettlementOutputSerializer(settlement).data)
+
+
+class ParkingSessionExitView(APIView):
+    permission_classes = [IsAdminOrOperatorRole]
+
+    @extend_schema(
+        request=ExitRequestSerializer,
+        responses={
+            200: ParkingSessionOutputSerializer,
+            409: OpenApiResponse(description="Exit or settlement-state conflict."),
+        },
+        examples=[
+            OpenApiExample(
+                "Record vehicle exit",
+                value={"exit_gate_id": 3},
+                request_only=True,
+            )
+        ],
+        description=(
+            "ADMIN or OPERATOR only. Requires a valid settlement, closes the session, and releases "
+            "occupancy atomically. Repeating the same exit preserves its original metadata."
+        ),
+        tags=["Parking sessions"],
+    )
+    def post(self, request: Request, pk: int) -> Response:
+        serializer = ExitRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        parking_session = build_exit_service().exit(
+            session_id=pk,
+            exit_gate_id=serializer.validated_data["exit_gate_id"],
+            actor=request.user,
+        )
         return Response(ParkingSessionOutputSerializer(parking_session).data)
 
 

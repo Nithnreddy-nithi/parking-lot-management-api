@@ -3,8 +3,12 @@ from django.urls import path
 from apps.sessions.api.views import (
     ParkingAvailabilityView,
     ParkingEntryView,
+    ParkingSessionCheckoutView,
     ParkingSessionDetailView,
+    ParkingSessionExitView,
     ParkingSessionListView,
+    ParkingSessionQuoteView,
+    ParkingSessionZeroSettlementView,
 )
 
 urlpatterns = [
@@ -18,6 +22,26 @@ urlpatterns = [
         "parking-sessions/<int:pk>/",
         ParkingSessionDetailView.as_view(),
         name="parking-session-detail",
+    ),
+    path(
+        "parking-sessions/<int:pk>/checkout/",
+        ParkingSessionCheckoutView.as_view(),
+        name="parking-session-checkout",
+    ),
+    path(
+        "parking-sessions/<int:pk>/quote/",
+        ParkingSessionQuoteView.as_view(),
+        name="parking-session-quote",
+    ),
+    path(
+        "parking-sessions/<int:pk>/settle-zero/",
+        ParkingSessionZeroSettlementView.as_view(),
+        name="parking-session-settle-zero",
+    ),
+    path(
+        "parking-sessions/<int:pk>/exit/",
+        ParkingSessionExitView.as_view(),
+        name="parking-session-exit",
     ),
     path(
         "parking-lots/<int:pk>/availability/",

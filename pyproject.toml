@@ -15,6 +15,7 @@ dependencies = [
     "drf-spectacular>=0.28,<0.29",
     "gunicorn>=23,<24",
     "psycopg[binary]>=3.2,<3.4",
+    "razorpay>=2.0,<2.1",
 ]
 
 [project.optional-dependencies]

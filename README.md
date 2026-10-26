@@ -1,9 +1,10 @@
 # Parking Lot Management API
 
 A Django 5.2 LTS and Django REST Framework modular monolith running on Python 3.12 and PostgreSQL.
-Phase 4 adds transactional vehicle entry, compatible spot allocation, parking tickets, scoped
-session reads, and informational availability to the existing JWT, user, parking-configuration, and
-vehicle foundation. Checkout, exit, pricing, payments, Redis, and Celery remain outside this phase.
+Phase 6 provides payment settlement and atomic vehicle exit. The payment boundary now supports both
+the persistent local simulator and Razorpay Standard Checkout, including signed confirmation,
+verified idempotent webhooks, reconciliation, and full or partial refunds. Redis and Celery remain
+outside the current scope.
 
 Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is available at
 `/api/v1/schema/`.
@@ -18,10 +19,15 @@ Interactive OpenAPI documentation is available at `/api/v1/docs/`; the schema is
 - `apps/accounts/permissions.py`: reusable application-role authorization.
 - `apps/parking/`: constrained parking models, configuration/vehicle APIs, selectors, services, and
   the idempotent demo-data command.
-- `apps/sessions/`: session lifecycle data, allocation policy, locking repository, entry service,
-  scoped read selectors, availability aggregation, APIs, and concurrency tests.
+- `apps/sessions/`: session lifecycle data, allocation policy, locking repository, entry, checkout,
+  and exit coordination, scoped read selectors, availability aggregation, APIs, and concurrency
+  tests.
+- `apps/pricing/`: versioned policies, immutable snapshots and quotes, pure fee calculators,
+  pricing-management APIs, selectors, and legacy backfill tooling.
+- `apps/payments/`: payment attempts, immutable settlements, refund ledger, provider protocol,
+  simulator and Razorpay adapters, signed webhook handling, reconciliation, scoped APIs, and tests.
 - `apps/<module>/`: accounts, parking, sessions, pricing, payments, reporting, and audit boundaries.
-  Pricing, payments, reporting, and audit remain intentional skeletons for later phases.
+  Reporting and audit remain intentional skeletons for later phases.
 - `tests/` and application `tests/` packages: PostgreSQL model, API, authentication, authorization,
   ownership, constraint, and query-count tests.
 - `docs/decisions/`: architecture and collaboration decisions.
@@ -41,7 +47,7 @@ application roles and timestamps.
 | --- | --- | --- | --- | --- |
 | CUSTOMER | Yes | No | No | Only if separately granted `is_staff` |
 | OPERATOR | Yes | Yes | No | Only if separately granted `is_staff` |
-| ADMIN | Yes | Yes when implemented | Yes | Only if separately granted `is_staff` |
+| ADMIN | Yes | Yes | Yes | Only if separately granted `is_staff` |
 | Django superuser | Yes | Privileged override | Yes, but its record is API-edit protected | Yes |
 
 `role` expresses business authority. `is_staff` controls access to Django's admin UI, while
@@ -58,6 +64,15 @@ Django flag. A PostgreSQL check constraint accepts only `ADMIN`, `OPERATOR`, or 
 | Admit a registered vehicle | Yes | Yes | No |
 | Session reads | All | All | Own vehicles only |
 | Availability summary | Yes | Yes | Yes |
+| Pricing policy management | Read/write | No | No |
+| Checkout | Yes | Yes | No |
+| Quote reads | All | All | Own vehicles only |
+| Initiate payment | All sessions | All sessions | Own vehicles only |
+| Settle zero quote | All sessions | All sessions | Own vehicles only |
+| Payment reads | All | All | Own vehicles only |
+| Refund reads | All | All | Own payments only |
+| Issue refund | Yes | No | No |
+| Record exit | Yes | Yes | No |
 
 Django superusers retain the documented configuration override. Vehicle access remains owner-scoped
 even for ADMIN and OPERATOR accounts. A cross-owner vehicle ID returns 404 rather than revealing that
@@ -111,15 +126,16 @@ There is deliberately no public endpoint for creating an ADMIN.
 
 ## Seed demo parking configuration
 
-After migrations, create one demo lot with basement/ground floors, entry/exit gates, and a mixture
-of motorcycle, compact, large, maintenance, and disabled spots:
+After migrations and ADMIN creation, create demo configuration and one initial INR policy for every
+vehicle type. The required username is recorded as the pricing creator; the command never creates a
+user or password:
 
 ```powershell
-docker compose exec web python manage.py seed_parking
+docker compose exec web python manage.py seed_parking --created-by app-admin
 ```
 
 The command is idempotent. Repeated runs add missing demo records but do not overwrite matching
-records that have been customized. It never creates users or passwords.
+configuration or any existing pricing history.
 
 ## Authentication examples
 
@@ -291,7 +307,7 @@ curl "http://localhost:8000/api/v1/parking-sessions/?status=ACTIVE&lot=1&entry_d
 ```
 
 Only staff may add `vehicle=<id>` to that query. Filters are strict, results are paginated, and
-ordering is newest `entered_at` then ID. No session `PATCH` or `DELETE` API exists in Phase 4.
+ordering is newest `entered_at` then ID. No session `PATCH` or `DELETE` API exists.
 
 Any authenticated user can read counts without customer or registration details:
 
@@ -311,9 +327,9 @@ POST /api/v1/parking-sessions/entry/
 → JWT authentication and ADMIN/OPERATOR permission
 → strict serializer accepts only vehicle_id and entry_gate_id
 → entry service opens one PostgreSQL transaction
-→ repository locks lot → gate → vehicle → selected spot
+→ repository locks lot → gate → vehicle → active pricing policy → selected spot
 → allocation policy applies compatibility and deterministic preference
-→ service rechecks eligibility and creates ACTIVE session snapshots
+→ service rechecks eligibility and creates the ACTIVE session and immutable pricing snapshot
 → PostgreSQL partial unique constraints guard vehicle and spot
 → safe ticket serializer returns HTTP 201
 ```
@@ -322,6 +338,241 @@ Lot-row serialization is deliberately correctness-first and limits parallel entr
 one lot. It can be replaced with finer-grained locking after measurement. The lock protocol,
 partial constraints, updated ER diagram, and sequence diagram are in
 [ADR 0004](docs/decisions/0004-transactional-entry-and-availability.md).
+
+## Pricing and checkout
+
+ADMIN publishes a new server-versioned policy. Publication retires the previous active version for
+the same lot and vehicle type in one transaction:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/pricing-policies/ \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"parking_lot":1,"vehicle_type":"CAR","currency":"INR","hourly_rate":"30.00","grace_minutes":15,"daily_cap":"300.00"}'
+```
+
+Published financial fields are immutable. Rate changes create version 2, version 3, and so on.
+Entry selects pricing by vehicle type—not allocated spot type—and copies the policy into a snapshot
+in the same transaction as the session. If pricing is missing, entry returns
+`PRICING_NOT_CONFIGURED` without creating a partial session.
+
+ADMIN or OPERATOR freezes the amount due with:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/checkout/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Checkout uses elapsed UTC duration, checks grace once, rounds every started hour upward, and applies
+the daily cap to consecutive 24-hour blocks from entry. It creates one immutable quote and changes
+`ACTIVE` to `PAYMENT_PENDING`. Repeated calls return that original quote and timestamp. The amount
+does not continue accruing after checkout in this product version.
+
+Checkout does not close the session, set `closed_at`, mark it paid, or release its spot. A
+zero-charge quote remains `PAYMENT_PENDING` until the explicit zero-charge settlement operation.
+
+Customers can read a quote only for their own session:
+
+```bash
+curl http://localhost:8000/api/v1/parking-sessions/1/quote/ \
+  -H "Authorization: Bearer <access-token>"
+```
+
+Sessions created before Phase 5 deliberately have no invented price. Select the historically
+correct policy explicitly and optionally restrict the affected session IDs:
+
+```powershell
+docker compose exec web python manage.py backfill_pricing_snapshots `
+  --policy-id 7 --session-id 101 --session-id 102
+```
+
+The command is idempotent and never overwrites a snapshot. Until backfilled, checkout returns
+`SESSION_PRICING_NOT_CONFIGURED`. Pricing decisions, the updated ER diagram, and checkout sequence
+are in [ADR 0005](docs/decisions/0005-versioned-pricing-and-checkout.md).
+
+## Payments, settlement, refunds, and exit
+
+A payment attempt records one interaction with the configured provider. A settlement is the single
+authoritative proof that the frozen quote has been paid. Failed attempts remain as history, while a
+quote has at most one successful attempt and one settlement. Clients supply only the parking
+session ID; amount, currency, merchant reference, and status are server-controlled.
+
+The local simulator is persistent in PostgreSQL rather than process memory, so repeated HTTP
+requests and different web workers observe the same provider-side result for an attempt UUID. Set
+`SIMULATED_PAYMENT_SCENARIO` in `.env` to `SUCCESS`, `FAILURE`, `PENDING`, or
+`TIMEOUT_AFTER_SUCCESS`, then restart the web process. This development control is never accepted
+from the public payment API.
+
+### Razorpay Test Mode configuration
+
+The backend integrates Razorpay through the official Python SDK. It creates a Razorpay Order; card,
+UPI, wallet, and bank credentials stay inside Razorpay Standard Checkout and never pass through this
+API. Start in Razorpay **Test Mode**, create API keys and a separate webhook secret, then set:
+
+```dotenv
+PAYMENT_PROVIDER=RAZORPAY
+RAZORPAY_KEY_ID=rzp_test_replace_me
+RAZORPAY_KEY_SECRET=replace_me
+RAZORPAY_WEBHOOK_SECRET=replace_me_with_a_different_secret
+```
+
+Rebuild after adding the SDK, then restart the services:
+
+```powershell
+docker compose up --build -d
+docker compose exec web python manage.py migrate
+```
+
+Configure this HTTPS webhook URL in the Razorpay Dashboard:
+
+```text
+https://<your-host>/api/v1/payments/webhooks/razorpay/
+```
+
+Subscribe to `payment.captured`, `payment.failed`, `refund.created`, `refund.processed`, and
+`refund.failed` where available. The handler validates `X-Razorpay-Signature` against the exact raw
+request body, requires `X-Razorpay-Event-Id`, and stores only event metadata plus a SHA-256 payload
+digest—not card data or the full webhook payload. Test and live dashboard modes need separate keys
+and webhook configuration.
+
+Initiate or reuse a payment for a positive frozen quote:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/payments/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"parking_session_id":1}'
+```
+
+With Razorpay selected, a pending response includes the safe public `checkout_key_id` and
+`provider_order_reference`. Pass those values, amount, and currency to Razorpay Standard Checkout.
+After Checkout returns its three signed values, confirm them server-side:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/payments/<attempt-uuid>/confirm/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"razorpay_order_id":"order_...","razorpay_payment_id":"pay_...","razorpay_signature":"..."}'
+```
+
+Signature verification alone does not settle the quote. The adapter fetches the payment from
+Razorpay and requires `captured` status with the exact frozen amount, currency, order, and merchant
+reference. Webhooks provide the durable path if the browser closes before confirmation.
+
+The service uses three boundaries:
+
+```text
+transaction 1: lock session → quote; create or reuse PENDING attempt; commit
+outside transaction: call provider using attempt UUID as stable merchant reference
+transaction 2: lock session → quote → attempt; validate result; settle and mark PAID; commit
+```
+
+No database lock is held across a provider call. A timeout is ambiguous: the provider may have
+charged successfully even though the application received no response. The attempt therefore stays
+`PENDING`; it is never treated as a confirmed failure or retried under a new merchant reference.
+Recover the recorded simulator result through the same result-processing service:
+
+```powershell
+docker compose exec web python manage.py reconcile_payment <attempt-uuid>
+```
+
+For a Razorpay order-creation timeout, reconciliation searches by the unique receipt derived from
+the unchanged attempt UUID, saves the recovered order ID, and then retrieves its payment. It never
+creates a new merchant reference for an uncertain result.
+
+Only an ADMIN can request a partial or full refund. Pending refunds reserve their amount under a
+settlement row lock, preventing concurrent requests from exceeding the captured payment:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/refunds/ \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"payment_attempt_id":"<attempt-uuid>","amount":"25.00","reason":"Approved adjustment"}'
+```
+
+Reconcile a known pending provider refund with:
+
+```powershell
+docker compose exec web python manage.py reconcile_refund <refund-uuid>
+```
+
+Refunds do not delete or mutate the original settlement and do not reopen a `PAID` or `CLOSED`
+parking session. If a refund-create response is lost before the provider refund ID is stored, locate
+the operation in the Razorpay Dashboard using the refund UUID in `notes` before reconciling; blindly
+reissuing it could duplicate money movement.
+
+For a quote whose frozen amount is exactly zero, settle without creating an attempt or contacting a
+provider:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/settle-zero/ \
+  -H "Authorization: Bearer <access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+After settlement the session is `PAID`, but its spot remains occupied. Only an ADMIN or OPERATOR can
+record physical exit through an active `EXIT` or `BOTH` gate in the same lot:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/exit/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"exit_gate_id":2}'
+```
+
+Exit locks session → gate → spot → quote → settlement → optional attempt, validates settlement,
+records the immutable exit gate, actor, and timestamp, and changes `PAID` to `CLOSED` atomically.
+Occupancy is derived from open session statuses, so no second occupied flag can drift. A disabled lot
+or floor and a maintenance spot do not trap an already-paid vehicle; only the selected exit gate
+must remain active and compatible.
+
+### Reproducible local lifecycle demo
+
+After setup, migrations, administrator creation, demo seeding, customer/vehicle creation, and token
+acquisition, substitute the returned IDs in this sequence:
+
+```bash
+# 1. Observe initial capacity.
+curl http://localhost:8000/api/v1/parking-lots/1/availability/ \
+  -H "Authorization: Bearer <operator-access-token>"
+
+# 2. Entry creates ACTIVE session and pricing snapshot.
+curl -X POST http://localhost:8000/api/v1/parking-sessions/entry/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":1,"entry_gate_id":1}'
+
+# 3. Checkout freezes quote and changes ACTIVE → PAYMENT_PENDING.
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/checkout/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" -d '{}'
+
+# 4. Default SUCCESS simulator settles quote and changes PAYMENT_PENDING → PAID.
+curl -X POST http://localhost:8000/api/v1/payments/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" -d '{"parking_session_id":1}'
+
+# 5. Exit changes PAID → CLOSED and releases derived occupancy.
+curl -X POST http://localhost:8000/api/v1/parking-sessions/1/exit/ \
+  -H "Authorization: Bearer <operator-access-token>" \
+  -H "Content-Type: application/json" -d '{"exit_gate_id":2}'
+
+# 6. Availability increases after CLOSED releases the spot.
+curl http://localhost:8000/api/v1/parking-lots/1/availability/ \
+  -H "Authorization: Bearer <operator-access-token>"
+```
+
+The migration adding exit attribution intentionally fails if historical `CLOSED` rows exist without
+verified exit gate and actor data. Export and resolve those records using operational evidence before
+retrying migration; the project never fabricates audit metadata. Full payment decisions, transaction
+boundaries, ER and lifecycle diagrams are in
+[ADR 0006](docs/decisions/0006-simulated-payments-settlement-and-exit.md). Simulator guarantees are
+test/dev guarantees only and are not evidence of real-provider behavior or certification.
+Razorpay-specific trust boundaries, failure handling, refunds, and webhook decisions are in
+[ADR 0007](docs/decisions/0007-razorpay-payments-webhooks-and-refunds.md).
 
 ## Errors
 

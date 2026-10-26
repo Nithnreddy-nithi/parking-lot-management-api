@@ -8,6 +8,8 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/", include("apps.accounts.api.urls")),
     path("api/v1/", include("apps.parking.api.urls")),
+    path("api/v1/", include("apps.pricing.api.urls")),
+    path("api/v1/", include("apps.payments.api.urls")),
     path("api/v1/", include("apps.sessions.api.urls")),
     path("api/v1/health/live/", live_health, name="health-live"),
     path("api/v1/schema/", SpectacularAPIView.as_view(), name="openapi-schema"),

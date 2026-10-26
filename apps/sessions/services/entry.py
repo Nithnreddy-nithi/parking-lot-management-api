@@ -5,6 +5,8 @@ from rest_framework.exceptions import NotFound
 
 from apps.parking.enums import GateType
 from apps.parking.models import Gate, Vehicle
+from apps.pricing.exceptions import PricingConflict
+from apps.pricing.services import create_snapshot, get_active_policy_for_entry
 from apps.sessions.allocation import AllocationStrategy, DeterministicAllocationStrategy
 from apps.sessions.exceptions import EntryConflict, vehicle_already_parked
 from apps.sessions.models import ParkingSession
@@ -36,7 +38,7 @@ class EntryService:
 
         try:
             with transaction.atomic():
-                # Shared lock order: lot -> gate -> vehicle -> spot.
+                # Shared lock order: lot -> gate -> vehicle -> pricing policy -> spot.
                 parking_lot = lock_lot(lot_id=gate_lot_id)
                 gate = lock_gate(gate_id=entry_gate_id)
                 try:
@@ -64,6 +66,16 @@ class EntryService:
                 if has_open_session_for_vehicle(vehicle_id=vehicle.pk):
                     raise vehicle_already_parked()
 
+                pricing_policy = get_active_policy_for_entry(
+                    lot_id=parking_lot.pk,
+                    vehicle_type=vehicle.vehicle_type,
+                )
+                if pricing_policy is None:
+                    raise PricingConflict(
+                        code="PRICING_NOT_CONFIGURED",
+                        detail="No active pricing policy exists for this vehicle type and lot.",
+                    )
+
                 spot = lock_preferred_spot(
                     lot_id=parking_lot.pk,
                     vehicle_type=vehicle.vehicle_type,
@@ -75,12 +87,14 @@ class EntryService:
                         detail="No compatible eligible parking spot is available.",
                     )
 
-                return create_active_session(
+                parking_session = create_active_session(
                     vehicle=vehicle,
                     spot=spot,
                     entry_gate=gate,
                     entered_by=actor,
                 )
+                create_snapshot(parking_session=parking_session, policy=pricing_policy)
+                return parking_session
         except IntegrityError as exc:
             constraint = _constraint_name(exc)
             if constraint == "session_one_open_per_vehicle":

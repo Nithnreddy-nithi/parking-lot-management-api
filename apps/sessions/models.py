@@ -35,6 +35,20 @@ class ParkingSession(models.Model):
         on_delete=models.PROTECT,
         related_name="entered_parking_sessions",
     )
+    exit_gate = models.ForeignKey(
+        Gate,
+        on_delete=models.PROTECT,
+        related_name="exited_parking_sessions",
+        null=True,
+        blank=True,
+    )
+    exited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="exited_parking_sessions",
+        null=True,
+        blank=True,
+    )
     entered_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
@@ -66,13 +80,20 @@ class ParkingSession(models.Model):
             ),
             models.CheckConstraint(
                 condition=(
-                    models.Q(status=SessionStatus.CLOSED, closed_at__isnull=False)
+                    models.Q(
+                        status=SessionStatus.CLOSED,
+                        closed_at__isnull=False,
+                        exit_gate__isnull=False,
+                        exited_by__isnull=False,
+                    )
                     | (
                         models.Q(status__in=OPEN_SESSION_STATUSES)
                         & models.Q(closed_at__isnull=True)
+                        & models.Q(exit_gate__isnull=True)
+                        & models.Q(exited_by__isnull=True)
                     )
                 ),
-                name="session_status_closed_at_consistent",
+                name="session_exit_metadata_consistent",
             ),
             models.CheckConstraint(
                 condition=(
