@@ -151,4 +151,3 @@ class RefundInitiationService:
                 reason=reason,
                 requested_by=actor,
             )
-
